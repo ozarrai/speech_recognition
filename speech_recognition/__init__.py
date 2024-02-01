@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 import wave
+import numpy as np
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -46,6 +47,8 @@ __license__ = "BSD"
 
 class AudioSource(object):
     def __init__(self):
+        self._channels = None
+        self._channel_id = None
         raise NotImplementedError("this is an abstract class")
 
     def __enter__(self):
@@ -53,7 +56,36 @@ class AudioSource(object):
 
     def __exit__(self, exc_type, exc_value, traceback):
         raise NotImplementedError("this is an abstract class")
+    
+    @property
+    def channels(self):
+        return self._channels
+    
+    @channels.setter
+    def channels(self, value):
+        if value < 1:
+            raise ValueError("Number of channels must be at least 1.")        
+        self._channels = value
+    
+    @property
+    def channel_id(self):
+        return self._channel_id
+    
+    @channel_id.setter
+    def channel_id(self, value):
+        if value < 0:
+            raise ValueError("Channel ID must be at least 0.")
+        if(value > self.channels - 1):
+            raise ValueError("Channel ID must be less than the number of channels.")
+        self._channel_id = value
+    
+    def extract_channel_data(self, buffer):
+        if self._channels is None or self._channels <= 1:
+            return buffer  # No extraction needed for mono audio
 
+        audio_data = np.frombuffer(buffer, dtype=np.int16)
+        channel_data = audio_data[self._channel_id::self._channels]
+        return channel_data.tobytes()
 
 class Microphone(AudioSource):
     """
@@ -71,10 +103,11 @@ class Microphone(AudioSource):
 
     Higher ``chunk_size`` values help avoid triggering on rapidly changing ambient noise, but also makes detection less sensitive. This value, generally, should be left at its default.
     """
-    def __init__(self, device_index=None, sample_rate=None, chunk_size=1024):
+    def __init__(self, device_index=None, sample_rate=None, chunk_size=1024, channels=1, channel_id=0):
         assert device_index is None or isinstance(device_index, int), "Device index must be None or an integer"
         assert sample_rate is None or (isinstance(sample_rate, int) and sample_rate > 0), "Sample rate must be None or a positive integer"
         assert isinstance(chunk_size, int) and chunk_size > 0, "Chunk size must be a positive integer"
+        assert isinstance(channels, int) and channels > 0 and channels < 100, "Channels must be a positive integer between 1 and 99"
 
         # set up PyAudio
         self.pyaudio_module = self.get_pyaudio()
@@ -95,6 +128,8 @@ class Microphone(AudioSource):
         self.SAMPLE_WIDTH = self.pyaudio_module.get_sample_size(self.format)  # size of each sample
         self.SAMPLE_RATE = sample_rate  # sampling rate in Hertz
         self.CHUNK = chunk_size  # number of frames stored in each buffer
+        self.channels = channels # number of channels provided by the microphone
+        self.channel_id = channel_id # channel to use for audio input
 
         self.audio = None
         self.stream = None
@@ -176,7 +211,7 @@ class Microphone(AudioSource):
         try:
             self.stream = Microphone.MicrophoneStream(
                 self.audio.open(
-                    input_device_index=self.device_index, channels=1, format=self.format,
+                    input_device_index=self.device_index, channels=self.channels, format=self.format,
                     rate=self.SAMPLE_RATE, frames_per_buffer=self.CHUNK, input=True,
                 )
             )
@@ -361,6 +396,8 @@ class Recognizer(AudioSource):
             buffer = source.stream.read(source.CHUNK)
             if len(buffer) == 0: break
 
+            buffer = source.extract_channel_data(buffer)
+
             if offset_reached or not offset:
                 elapsed_time += seconds_per_buffer
                 if duration and elapsed_time > duration: break
@@ -391,6 +428,8 @@ class Recognizer(AudioSource):
             elapsed_time += seconds_per_buffer
             if elapsed_time > duration: break
             buffer = source.stream.read(source.CHUNK)
+
+            buffer = source.extract_channel_data(buffer)
             energy = audioop.rms(buffer, source.SAMPLE_WIDTH)  # energy of the audio signal
 
             # dynamically adjust the energy threshold using asymmetric weighted average
@@ -432,6 +471,8 @@ class Recognizer(AudioSource):
 
             buffer = source.stream.read(source.CHUNK)
             if len(buffer) == 0: break  # reached end of the stream
+
+            buffer = source.extract_channel_data(buffer)
             frames.append(buffer)
 
             # resample audio to the required sample rate
@@ -490,6 +531,8 @@ class Recognizer(AudioSource):
 
                     buffer = source.stream.read(source.CHUNK)
                     if len(buffer) == 0: break  # reached end of the stream
+
+                    buffer = source.extract_channel_data(buffer)
                     frames.append(buffer)
                     if len(frames) > non_speaking_buffer_count:  # ensure we only keep the needed amount of non-speaking buffers
                         frames.popleft()
@@ -522,6 +565,8 @@ class Recognizer(AudioSource):
 
                 buffer = source.stream.read(source.CHUNK)
                 if len(buffer) == 0: break  # reached end of the stream
+
+                buffer = source.extract_channel_data(buffer)
                 frames.append(buffer)
                 phrase_count += 1
 
